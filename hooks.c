@@ -24,6 +24,58 @@ LRESULT CALLBACK HotKeysWinProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 #define HIDELAYOUT_TIMER  (6)
 #define POOL_TIMER        (7)
 
+// ==================== ALTSNAP_DIAG diagnostic instrumentation ==============
+// Forensic build: ALTSNAP_DIAG=1 enables a side-effect-free diagnostic log
+// appended+flushed line by line to DIAG_LOG_PATH, so nothing is lost even if
+// AltSnap crashes or is killed. Set ALTSNAP_DIAG to 0 to compile ALL the
+// instrumentation out (zero overhead, byte-identical original behaviour).
+#define ALTSNAP_DIAG 0
+#ifdef ALTSNAP_DIAG
+#define DIAG_LOG_PATH "m:/08_Project/VSCODE/AltSnap/altsnap_diag.log"
+#define DIAG_TIMER (8)
+static DWORD g_diagLastMouseCb = 0; // tick of last LowLevelMouseProc entry
+static DWORD g_diagLastKeyCb = 0;   // tick of last LowLevelKeyboardProc entry
+// Tick of the most recent observed VK_LWIN key-UP (Win-key stuck probe anchor).
+static DWORD g_diagLastLWinUp = 0;
+// Per-button physical-down start tick + one-shot report flag (mouse-button stuck
+// probe). Index order matches DIAG_MBTN_* : {L, R, M, X1, X2}.
+static DWORD g_diagMBtnDownStart[5] = {0,0,0,0,0};
+static int   g_diagMBtnStuckReported[5] = {0,0,0,0,0};
+static void Diag(const char *fmt, ...);
+static void DiagDumpState(void);
+// Cursor coordinate helpers reused by the probes (read-only, single purpose).
+static int diag_cx(void) { POINT p; GetCursorPos(&p); return (int)p.x; }
+static int diag_cy(void) { POINT p; GetCursorPos(&p); return (int)p.y; }
+#define DIAG(...)   Diag(__VA_ARGS__)
+#define DIAG_DUMP() DiagDumpState()
+#else
+#define DIAG(...)   ((void)0)
+#define DIAG_DUMP() ((void)0)
+#endif
+// Keyboard hook exit probes (pure logging; they never alter the return value).
+#ifdef ALTSNAP_DIAG
+#define KEY_SWALLOW(reason) do { DIAG("KEY-SWALLOW vkey=0x%X dir=%s reason=%s", (unsigned)vkey, keydir, (reason)); return 1; } while(0)
+#define KEY_PASS(reason)    do { DIAG("KEY-PASS vkey=0x%X dir=%s ret=0 (PASS) reason=%s", (unsigned)vkey, keydir, (reason)); return CallNextHookEx(NULL, nCode, wParam, lParam); } while(0)
+#else
+#define KEY_SWALLOW(reason) return 1
+#define KEY_PASS(reason)    return CallNextHookEx(NULL, nCode, wParam, lParam)
+#endif
+// Modifier-key async bitmap (GetAsyncKeyState press bit) reused by probes.
+#define DIAG_MODS_FMT "LSHIFT=%d RSHIFT=%d LMENU=%d RMENU=%d LWIN=%d RWIN=%d LCTRL=%d RCTRL=%d"
+#define DIAG_MODS_ARG !!(GetAsyncKeyState(VK_LSHIFT)&0x8000), !!(GetAsyncKeyState(VK_RSHIFT)&0x8000), \
+    !!(GetAsyncKeyState(VK_LMENU)&0x8000), !!(GetAsyncKeyState(VK_RMENU)&0x8000), \
+    !!(GetAsyncKeyState(VK_LWIN)&0x8000), !!(GetAsyncKeyState(VK_RWIN)&0x8000), \
+    !!(GetAsyncKeyState(VK_LCONTROL)&0x8000), !!(GetAsyncKeyState(VK_RCONTROL)&0x8000)
+// Physical mouse-button async bitmap (GetAsyncKeyState press bit) + cursor/fg,
+// reused by every mouse/key probe. Saved/restored nothing: pure reads only.
+#define DIAG_MBTN_FMT "mbtn=L%d R%d M%d X1%d X2%d"
+#define DIAG_MBTN_ARG !!(GetAsyncKeyState(VK_LBUTTON)&0x8000), !!(GetAsyncKeyState(VK_RBUTTON)&0x8000), \
+    !!(GetAsyncKeyState(VK_MBUTTON)&0x8000), !!(GetAsyncKeyState(VK_XBUTTON1)&0x8000), \
+    !!(GetAsyncKeyState(VK_XBUTTON2)&0x8000)
+#define DIAG_CFG_FMT "cursor=(%d,%d) fg=0x%X " DIAG_MBTN_FMT
+#define DIAG_CFG_ARG diag_cx(), diag_cy(), (unsigned)(UINT_PTR)GetForegroundWindow(), DIAG_MBTN_ARG
+// ===========================================================================
+
 #define WM_DOWORK        (WM_APP+6)
 #define WM_DOMOUSEMOVE   (WM_APP+7)
 #define WM_DOACTION      (WM_APP+8)
@@ -50,6 +102,8 @@ static DWORD g_WorkerThreadID;
 static HANDLE g_WorkerThreadHANDLE;
 static UCHAR g_InFinishMovement;
 static UCHAR g_InMouseMove;
+static UCHAR g_SynthXButton; // Marks mouse events injected by SimulateXButton()
+static UCHAR g_ReinjectXButtonUp; // Marks a remedial synthetic XBUTTON UP that must reach the OS
 
 static void UnhookMouse();
 static void HookMouse();
@@ -2377,6 +2431,10 @@ static void MouseMoveNow(POINT pt)
 /////////////////////////////////////////////////////////////////////////////
 static void Send_KEY(unsigned char vkey)
 {
+    #ifdef ALTSNAP_DIAG
+    DIAG("Send_KEY vkey=%02X dir=DOWN+UP EndSendKey=%02X mods[" DIAG_MODS_FMT "]",
+         (unsigned)vkey, (unsigned)conf.EndSendKey, DIAG_MODS_ARG);
+    #endif
     KEYBDINPUT ctrl[2] = { {0, 0, 0, 0, 0}, {0, 0 , KEYEVENTF_KEYUP, 0, 0} };
     ctrl[0].wVk = ctrl[1].wVk = vkey;
     ctrl[0].dwExtraInfo = ctrl[1].dwExtraInfo = GetMessageExtraInfo();
@@ -2392,6 +2450,11 @@ static void Send_KEY(unsigned char vkey)
 // Call with or KEYEVENTF_KEYDOWN/KEYEVENTF_KEYUP
 static void Send_KEY_UD(unsigned char vkey, WORD flags)
 {
+    #ifdef ALTSNAP_DIAG
+    DIAG("Send_KEY_UD vkey=%02X dir=%s EndSendKey=%02X mods[" DIAG_MODS_FMT "]",
+         (unsigned)vkey, (flags&KEYEVENTF_KEYUP)?"UP":"DOWN",
+         (unsigned)conf.EndSendKey, DIAG_MODS_ARG);
+    #endif
     KEYBDINPUT ctrl = {0, 0, 0, 0, 0};
     ctrl.wVk = vkey;
     ctrl.dwExtraInfo = GetMessageExtraInfo();
@@ -2405,7 +2468,7 @@ static void Send_KEY_UD(unsigned char vkey, WORD flags)
     SendInput(1, &input, sizeof(input));
     InterlockedDecrement(&state.ignorekey);
 }
-#define Send_CTRL() if (conf.EndSendKey) { Send_KEY(conf.EndSendKey); LOG("END KEY SENT"); }
+#define Send_CTRL() if (conf.EndSendKey) { DIAG("Send_CTRL EndSendKey=%02X mods[" DIAG_MODS_FMT "]", (unsigned)conf.EndSendKey, DIAG_MODS_ARG); Send_KEY(conf.EndSendKey); LOG("END KEY SENT"); }
 
 // Send a sequence of Inputs.....
 static void SendInputSequence(const UCHAR *seq)
@@ -2450,9 +2513,15 @@ static DWORD WINAPI Send_ClickProc(LPVOID buttonD)
     input[0].type = input[1].type = INPUT_MOUSE;
     input[0].mi = click[0]; input[1].mi = click[1];
 
+#ifdef ALTSNAP_DIAG
+    DIAG("IGNORECLICK set=1 @hooks.c:%d context=Send_ClickProc", __LINE__);
+#endif
     InterlockedIncrement(&state.ignoreclick);
     SendInput(2, input, sizeof(*input));
     InterlockedDecrement(&state.ignoreclick);
+#ifdef ALTSNAP_DIAG
+    DIAG("IGNORECLICK set=0 @hooks.c:%d context=Send_ClickProc", __LINE__);
+#endif
     return 0;
 }
 #define Send_Click(x) Send_ClickProc((LPVOID)(LONG_PTR)(x));
@@ -2502,18 +2571,30 @@ static void HotkeyUp(void)
     // The way this works is that the alt key is "disguised" by sending
     // ctrl keydown/keyup events
     LOG("HotkeyUp()");
+    #ifdef ALTSNAP_DIAG
+    DIAG("HotkeyUp ENTER alt=%d blockaltup=%d blockmouseup=%d ctrl=%d shift=%d action=%d clickbutton=%d",
+         (int)state.alt, (int)state.blockaltup, (int)state.blockmouseup, (int)state.ctrl,
+         (int)state.shift, (int)state.action.ac, (int)state.clickbutton);
+    #endif
     if (state.blockaltup || state.action.ac) {
         Send_CTRL();
         state.blockaltup = 0;
         // If there is more that one key down remaining
         // then we must block the next alt up.
         if (NumKeysDown() > 1) state.blockaltup = 1;
+        #ifdef ALTSNAP_DIAG
+        DIAG("HotkeyUp after Send_CTRL alt=%d blockaltup=%d NumKeysDown=%d",
+             (int)state.alt, (int)state.blockaltup, (int)NumKeysDown());
+        #endif
     }
 
     // Hotkeys have been released
     state.alt = 0;
     state.alt1 = 0;
-    if (state.action.ac
+    // Do not finish a movement that a mouse-up handler already asked to finish
+    // (g_InFinishMovement). This keeps HotkeyUp() idempotent when it is called
+    // symmetrically right after a synthesized button up.
+    if (state.action.ac && !g_InFinishMovement
     && (conf.GrabWithAlt[0].ac || conf.GrabWithAlt[1].ac)
     && (MOUVEMENT(conf.GrabWithAlt[0]) || MOUVEMENT(conf.GrabWithAlt[1]))) {
         FinishMovementAsync();
@@ -2606,6 +2687,8 @@ static void ReallySetForegroundWindow(HWND hwnd)
     if (!hwnd) return;
     // Check existing foreground Window.
     HWND  fore = GetForegroundWindow();
+    DIAG("ReallySetForegroundWindow hwnd=%lx fore=%lx state.alt=%d",
+         (unsigned long)(UINT_PTR)hwnd, (unsigned long)(UINT_PTR)fore, (int)state.alt);
     if (fore != hwnd) {
         if (state.alt != VK_MENU &&  state.alt != VK_CONTROL
         && !(GetKeyState(VK_CONTROL)&0x8000)
@@ -2614,20 +2697,29 @@ static void ReallySetForegroundWindow(HWND hwnd)
             // We need to activate the window with key input.
             // CTRL seems to work. Also Alt works but trigers the menu
             // So it is simpler to stick to CTRL.
+            DIAG("ReallySetForegroundWindow -> Send_KEY(VK_CONTROL)");
             Send_KEY(VK_CONTROL);
         }
         BringWindowToTop(hwnd);
         SetForegroundWindow(hwnd);
+        DIAG("ReallySetForegroundWindow RESULT hwnd=%lx actual=%lx",
+             (unsigned long)(UINT_PTR)hwnd, (unsigned long)(UINT_PTR)GetForegroundWindow());
     }
+    DIAG("ReallySetForegroundWindow EXIT requested=%lx actual=%lx",
+         (unsigned long)(UINT_PTR)hwnd, (unsigned long)(UINT_PTR)GetForegroundWindow());
 }
 static void SetForegroundWindowL(HWND hwnd)
 {
+    DIAG("SetForegroundWindowL hwnd=%lx mdiclient=%lx",
+         (unsigned long)(UINT_PTR)hwnd, (unsigned long)(UINT_PTR)state.mdiclient);
     if (!state.mdiclient) {
         ReallySetForegroundWindow(hwnd);
     } else {
         ReallySetForegroundWindow(state.mdiclient);
         PostMessage(state.mdiclient, WM_MDIACTIVATE, (WPARAM)hwnd, 0);
     }
+    DIAG("SetForegroundWindowL DONE requested=%lx actual=%lx",
+         (unsigned long)(UINT_PTR)hwnd, (unsigned long)(UINT_PTR)GetForegroundWindow());
 }
 // Returns true if AltDrag must be disabled based on scroll lock
 // If conf.ScrollLockState&2 then Altdrag is disabled by Scroll Lock
@@ -2687,6 +2779,80 @@ static void LogState(const char *Title)
     , (int)state.ignorekey );
     fclose(f);
 }
+#ifdef ALTSNAP_DIAG
+// Append one fully-flushed diagnostic line. No state is touched: pure logging.
+static void Diag(const char *fmt, ...)
+{
+    char buf[512];
+    char line[640];
+    va_list ap;
+    va_start(ap, fmt);
+    wvsprintfA(buf, fmt, ap); // same formatter as LOGfunk (avoids __ms_vsnprintf in nostdlib build)
+    va_end(ap);
+    // Uniform timestamp prefix (ms tick + thread id) so event ordering can be
+    // aligned even across threads. Pure formatting: no state/control-flow change.
+    wsprintfA(line, "[t=%lu tid=%lu] %s", (unsigned long)GetTickCount(),
+              (unsigned long)GetCurrentThreadId(), buf);
+    FILE *f = fopen(DIAG_LOG_PATH, "a");
+    if (!f) return;
+    fputs(line, f);
+    fputc('\n', f);
+    fflush(f);   // ensure the line hits disk before any crash/exit
+    fclose(f);
+}
+// Decisive periodic probe: distinguishes "physical key still held" (async=1)
+// from "internal flag not cleared" (flag=1 but async=0).
+static void DiagDumpState(void)
+{
+    DWORD now = GetTickCount();
+    Diag("[DUMP] tick=%lu alt=%d blockaltup=%d blockmouseup=%d ctrl=%d shift=%d action=%d "
+         "clickbutton=%d mousehook=%lx keyhook=%lx mousehookNull=%d keyhookNull=%d "
+         "lastMouseCb=%lu lastKeyCb=%lu " DIAG_CFG_FMT " async: " DIAG_MODS_FMT,
+        (unsigned long)now,
+        (int)state.alt, (int)state.blockaltup, (int)state.blockmouseup,
+        (int)state.ctrl, (int)state.shift, (int)state.action.ac,
+        (int)state.clickbutton, (unsigned long)(UINT_PTR)mousehook,
+        (unsigned long)(UINT_PTR)g_keyhook,
+        (int)(mousehook==NULL), (int)(g_keyhook==NULL),
+        (unsigned long)g_diagLastMouseCb, (unsigned long)g_diagLastKeyCb,
+        DIAG_CFG_ARG,
+        DIAG_MODS_ARG);
+    {
+        // Win-key stuck probe: VK_LWIN physically held but no keyboard event for
+        // a long time (keyboard hook has gone quiet) => the matching key-up was
+        // lost by the OS/session. Purely observational.
+        if ((GetAsyncKeyState(VK_LWIN)&0x8000) && g_diagLastLWinUp
+        && (now - g_diagLastLWinUp) > 3000) {
+            Diag("WINKEY-STUCK-DETECTED tick=%lu alt=%d action=%d ignoreclick=%d fg=0x%X cursor=(%d,%d)",
+                 (unsigned long)now, (int)state.alt, (int)state.action.ac,
+                 (int)state.ignoreclick,
+                 (unsigned)(UINT_PTR)GetForegroundWindow(), diag_cx(), diag_cy());
+        }
+    }
+    {
+        // Mouse-button stuck probe: a button reported physically down for more
+        // than ~3s with async never clearing (no matching UP observed) => stuck.
+        static const int mbv[5] = {VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2};
+        static const char *mbn[5] = {"L", "R", "M", "X1", "X2"};
+        int i;
+        for (i = 0; i < 5; i++) {
+            if (GetAsyncKeyState(mbv[i])&0x8000) {
+                if (!g_diagMBtnDownStart[i])
+                    g_diagMBtnDownStart[i] = now;
+                else if (!g_diagMBtnStuckReported[i] && (now - g_diagMBtnDownStart[i]) > 3000) {
+                    g_diagMBtnStuckReported[i] = 1;
+                    Diag("MBTN-STUCK-DETECTED which=%s duration=%lu tick=%lu fg=0x%X cursor=(%d,%d)",
+                         mbn[i], (unsigned long)(now - g_diagMBtnDownStart[i]), (unsigned long)now,
+                         (unsigned)(UINT_PTR)GetForegroundWindow(), diag_cx(), diag_cy());
+                }
+            } else {
+                g_diagMBtnDownStart[i] = 0;
+                g_diagMBtnStuckReported[i] = 0;
+            }
+        }
+    }
+}
+#endif
 static pure int XXButtonIndex(UCHAR vkey)
 {
     for (WORD i=0; i < MAXKEYS && conf.XXButtons[i]; i++) {
@@ -2705,7 +2871,14 @@ static int SimulateXButton(WPARAM wp, WORD xbtidx)
     msg.mouseData= xbtidx << 16;
     msg.flags=0;
     msg.time = GetTickCount();
+    // Mark the event as synthesized so the mouse hook can tell it apart from a
+    // real button press: it must NOT be forwarded to the OS (otherwise a
+    // phantom XButton would be injected into the system) and it must not be
+    // treated as a genuine real click for the hotclick machinery.
+    UCHAR oldsynth = g_SynthXButton;
+    g_SynthXButton = 1;
     LowLevelMouseProc(HC_ACTION, wp, (LPARAM)&msg);
+    g_SynthXButton = oldsynth;
     return 1;
 }
 // Destroy AltSnap's menu
@@ -2732,10 +2905,23 @@ static HWND MDIorNOT(HWND hwnd, HWND *mdiclient_);
 // Keep this one minimalist, it is always on.
 LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
 {
+#ifdef ALTSNAP_DIAG
+    g_diagLastKeyCb = GetTickCount(); // hook-health heartbeat (pure write)
+#endif
     if (nCode != HC_ACTION || state.ignorekey) return CallNextHookEx(NULL, nCode, wParam, lParam);
 
     PKBDLLHOOKSTRUCT kbh = ((PKBDLLHOOKSTRUCT)lParam);
     unsigned char vkey = kbh->vkCode;
+    const char *keydir = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) ? "UP" : "DOWN";
+#ifdef ALTSNAP_DIAG
+    // Remember the last physical VK_LWIN key-UP (Win-key stuck probe anchor).
+    if (vkey == VK_LWIN && (wParam == WM_KEYUP || wParam == WM_SYSKEYUP))
+        g_diagLastLWinUp = GetTickCount();
+#endif
+    DIAG("KEY-IN vkey=0x%X dir=%s IsHotkey=%d IsModKey=%d ignorekey=%d alt=%d blockaltup=%d action=%d " DIAG_CFG_FMT,
+         (unsigned)vkey, keydir, (int)IsHotkey(vkey), (int)IsModKey(vkey),
+         (int)state.ignorekey, (int)state.alt, (int)state.blockaltup, (int)state.action.ac,
+         DIAG_CFG_ARG);
 //    DWORD scode = kbh->scanCode;
     int xxbtidx;
     HWND fhwnd = NULL;
@@ -2744,7 +2930,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
 //        , wParam, kbh->vkCode, kbh->scanCode, kbh->flags, kbh->dwExtraInfo);
 //    }
     if (vkey == VK_SCROLL) PostMessage(g_mainhwnd, WM_UPDATETRAY, 0, 0);
-    if (ScrollLockState()) return CallNextHookEx(NULL, nCode, wParam, lParam);
+    if (ScrollLockState()) KEY_PASS("scrolllock");
 
     if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
         if (!state.alt && !state.action.ac
@@ -2755,6 +2941,8 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
             state.alt = vkey;
             state.blockaltup = 0;
             state.sclickhwnd = NULL;
+            DIAG("HOTKEY DOWN vkey=%02X IsHotkey=%d IsModKey=%d -> state.alt=%d blockaltup=0",
+                 (unsigned)vkey, (int)IsHotkey(vkey), (int)IsModKey(vkey), (int)state.alt);
             KillAltSnapMenu(); // Hide unikey menu in case...
 
             // Release ALt even if we receave no AltUP message because of.
@@ -2805,11 +2993,15 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
 
             // Block keydown to prevent Windows from changing keyboard layout
             if (state.alt && state.action.ac) {
-                return 1;
+                DIAG("SWALLOW branch=SHIFT vkey=%02X alt=%d blockaltup=%d action=%d",
+                     (unsigned)vkey, (int)state.alt, (int)state.blockaltup, (int)state.action.ac);
+                KEY_SWALLOW("shift-layout");
             }
         } else if (vkey == VK_SPACE && state.action.ac && !IsSamePTT(&state.clickpt, &state.prevpt)) {
+            DIAG("SWALLOW branch=SPACE vkey=%02X alt=%d blockaltup=%d action=%d",
+                 (unsigned)vkey, (int)state.alt, (int)state.blockaltup, (int)state.action.ac);
             ToggleSnapState();
-            return 1; // Block to avoid sys menu.
+            KEY_SWALLOW("space-sysmenu"); // Block to avoid sys menu.
         } else if (state.alt && state.action.ac == conf.GrabWithAlt[ModKey()].ac && IsKillkey(vkey)) {
            // Release Hook on Alt+KillKey
            // eg: DisplayFusion Alt+Tab elevated windows captures AltUp
@@ -2821,11 +3013,16 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
             state.shift = 0;
             LastWin.hwnd = NULL;
             state.ignorekey = 0; // In case ...
+#ifdef ALTSNAP_DIAG
+            if (state.ignoreclick)
+                DIAG("IGNORECLICK set=0 @hooks.c:%d context=escape-key old=%d",
+                     __LINE__, (int)state.ignoreclick);
+#endif
             state.ignoreclick = 0; // In case ...
             if (state.unikeymenu || g_mchwnd) {
                 int ret = IsMenu(state.unikeymenu);
                 KillAltSnapMenu();
-                if (ret) return 1;
+                if (ret) KEY_SWALLOW("escape-menu");
             }
 
             // Stop current action
@@ -2841,7 +3038,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
                 UnhookMouse();
 
                 // Block ESC if an action was ongoing
-                if (action.ac) return 1;
+                if (action.ac) KEY_SWALLOW("escape-action");
             }
         } else if (!state.ctrl
                && (state.alt!=vkey) /* avoid cursor trapping at first Ctrl dwn if Ctrl was used as hotkey */
@@ -2861,15 +3058,18 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
         } else if (state.sclickhwnd && g_mchwnd && state.alt && (vkey == VK_LMENU || vkey == VK_RMENU)) {
             // Block Alt down when the altsnap's menu just opened
             if (state.unikeymenu==(HMENU)1
-            || (IsWindow(state.sclickhwnd)  && IsWindow(g_mchwnd) && IsMenu(state.unikeymenu)))
-                return 1;
+            || (IsWindow(state.sclickhwnd)  && IsWindow(g_mchwnd) && IsMenu(state.unikeymenu))) {
+                DIAG("SWALLOW branch=ALT-MENU vkey=%02X alt=%d blockaltup=%d action=%d",
+                     (unsigned)vkey, (int)state.alt, (int)state.blockaltup, (int)state.action.ac);
+                KEY_SWALLOW("alt-menu");
+            }
         } else if ((xxbtidx = XXButtonIndex(vkey)) >=0
         && (GetAction(BT_MMB+xxbtidx).ac ||  GetActionT(BT_MMB+xxbtidx).ac || IsHotclick(BT_MMB+xxbtidx))) {
             if (!state.xxbutton) {
                 state.xxbutton = 1; // To Ignore autorepeat...
                 SimulateXButton(WM_XBUTTONDOWN, xxbtidx);
             }
-            return 1;
+            KEY_SWALLOW("xbutton-down");
 
 
         } else if (conf.UniKeyHoldMenu
@@ -2884,15 +3084,17 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
                 { VK_BACK, VK_TAB, VK_APPS, VK_DELETE, VK_SPACE, VK_LEFT, VK_RIGHT
                 , VK_PRIOR, VK_NEXT, VK_END, VK_HOME, 0};
             if (state.unikeymenu && IsMenu(state.unikeymenu) && !(GetKeyState(vkey)&0x8000)) {
-                if (vkey == VK_SNAPSHOT) return CallNextHookEx(NULL, nCode, wParam, lParam);
+                if (vkey == VK_SNAPSHOT) KEY_PASS("unikeymenu-snapshot");
                 if (IsHotkeyy(vkey, menupopdownkeys)) {
                     KillAltSnapMenu();
-                    return CallNextHookEx(NULL, nCode, wParam, lParam);
+                    KEY_PASS("unikeymenu-popdown");
                 }
 
                 // Forward all keys to the menu...
                 PostMessage(g_mchwnd, WM_KEYDOWN, vkey, 0); // all keys are "directed to the Menu"
-                return 1; // block keydown
+                DIAG("SWALLOW branch=UNIKEYMENU-FORWARD vkey=%02X alt=%d blockaltup=%d action=%d",
+                     (unsigned)vkey, (int)state.alt, (int)state.blockaltup, (int)state.action.ac);
+                KEY_SWALLOW("unikeymenu-forward"); // block keydown
 
             } else if (!state.ctrl && !state.alt && (0x41 <= vkey && vkey <= 0x5A) && !IsAKeyDown(ctrlaltwinkeys) ) {
                 // handle long A-Z keydown.
@@ -2904,11 +3106,19 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
                         UCHAR shiftdown = GetKeyState(VK_SHIFT)&0x8000 || GetKeyState(VK_CAPITAL)&1;
                         PostMessage(g_mainhwnd, WM_UNIKEYMENU, (WPARAM)g_mchwnd, vkey|(shiftdown<<8) );
                     }
-                    return 1; // block keydown
+                    DIAG("SWALLOW branch=UNIKEYMENU-AUTOREPEAT vkey=%02X alt=%d blockaltup=%d action=%d",
+                         (unsigned)vkey, (int)state.alt, (int)state.blockaltup, (int)state.action.ac);
+                    KEY_SWALLOW("unikeymenu-autorepeat"); // block keydown
                 }
             }
         }
     } else if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
+        if (vkey==VK_MENU||vkey==VK_LMENU||vkey==VK_RMENU||vkey==VK_LWIN||vkey==VK_RWIN
+        || vkey==VK_LCONTROL||vkey==VK_RCONTROL) {
+            DIAG("KEYUP-MOD vkey=%02X IsHotkey=%d IsModKey=%d alt=%d blockaltup=%d action=%d clickbutton=%d",
+                 (unsigned)vkey, (int)IsHotkey(vkey), (int)IsModKey(vkey),
+                 (int)state.alt, (int)state.blockaltup, (int)state.action.ac, (int)state.clickbutton);
+        }
         if (IsHotkey(vkey)) {
             //LOGA("ALT UP");
             HotkeyUp();
@@ -2929,12 +3139,23 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
             if (NumKeysDown() > 1) state.blockaltup = 1;
         } else if ((xxbtidx = XXButtonIndex(vkey)) >=0 ) {
             state.xxbutton = 0;
+            // Feed the (synthetic) mouse up to the mouse hook first; it will
+            // finish any ongoing movement.
             SimulateXButton(WM_XBUTTONUP, xxbtidx);
-            return 1;
+            // ...then symmetrically release the hotkey state. This clears the
+            // pseudo-hotkey (state.alt), closes blockaltup and flushes the
+            // modifier keys (CTRL/ALT/WIN), so no key stays stuck. Without it
+            // the Win/Alt key already seen as a hotkey would stay latched.
+            if (state.blockaltup || state.alt || state.action.ac || IsHotclick(BT_MMB+xxbtidx)) {
+                HotkeyUp();
+            }
+            KEY_SWALLOW("xbutton-up");
         }
 
         // Always process Ctrl Up.
         if (vkey == VK_LCONTROL || vkey == VK_RCONTROL) {
+            DIAG("KEYUP-CTRL fallthrough vkey=%02X ctrl=%d alt=%d blockaltup=%d action=%d",
+                 (unsigned)vkey, (int)state.ctrl, (int)state.alt, (int)state.blockaltup, (int)state.action.ac);
             // If menu is present inform it that we released Ctrl.
             //if (state.unikeymenu) PostMessage(g_mchwnd, WM_CLOSEMODE, 0, 0);
             ClipCursorOnce(NULL); // Release cursor trapping
@@ -2944,7 +3165,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
         }
     }
 
-    return CallNextHookEx(NULL, nCode, wParam, lParam);
+    KEY_PASS("key-final");
 }
 /////////////////////////////////////////////////////////////////////////////
 // 1.44
@@ -4995,10 +5216,11 @@ static void StopSpeedMes(void)
 }
 static DWORD WINAPI SendAltCtrlAlt(LPVOID p)
 {
+    DIAG("SendAltCtrlAlt BEGIN mods[" DIAG_MODS_FMT "]", DIAG_MODS_ARG);
     Send_KEY_UD(VK_MENU, KEYEVENTF_KEYDOWN);
     Send_KEY(VK_CONTROL);
     Send_KEY_UD(VK_MENU, KEYEVENTF_KEYUP);
-
+    DIAG("SendAltCtrlAlt END mods[" DIAG_MODS_FMT "]", DIAG_MODS_ARG);
     return 1;
 }
 static int xpure DoubleClamp(int ptx, int left, int right, int rwidth)
@@ -5083,7 +5305,13 @@ static int init_movement_and_actions(POINT pt, HWND hwnd, action_t action, int b
     if (probemode || action.ac == AC_NONE) return 1;
 
     // Set state
-    state.blockaltup = state.alt; // If alt is down...
+    // Only a genuine keyboard hotkey (Alt) needs its Alt-up to be disguised with
+    // a Ctrl press. state.alt is also (ab)used to hold the hotclick mouse button;
+    // in that case there is no Alt-up, so blockaltup must stay cleared, otherwise
+    // it leaks and later triggers spurious Ctrl/hotkey state (stuck keys).
+    state.blockaltup = IsHotclick(state.alt)? 0: state.alt; // If alt is down...
+    DIAG("init_movement_and_actions SET blockaltup=%d (alt=%d IsHotclick(alt)=%d action=%d button=%d)",
+         (int)state.blockaltup, (int)state.alt, (int)IsHotclick(state.alt), (int)action.ac, (int)button);
     // return if window has to be moved/resized and does not respond in 1/4 s.
     state.prevpt=pt;
 
@@ -5285,6 +5513,36 @@ static DWORD WINAPI FinishMovementNow(LPVOID pp)
     state.moving = 0;
     state.snap = conf.AutoSnap;
     state.cached_hwnd_blacklist = NULL;
+    // Defensive: a gesture must never leave a button logically held. clickbutton
+    // has been observed to stay stuck on a side button (5/6) after a hotclick
+    // drag, which made AltSnap itself treat every later click as busy.
+    state.clickbutton = BT_NONE;
+    // Defensive: if the OS still believes a side button is physically down (its
+    // matching UP was swallowed on some path), synthesize the missing UP so the
+    // system clears VK_XBUTTON1/XBUTTON2. The injected UP is flagged so our own
+    // mouse hook lets it through instead of swallowing it again.
+    if (GetAsyncKeyState(VK_XBUTTON1)&0x8000 || GetAsyncKeyState(VK_XBUTTON2)&0x8000) {
+        INPUT xup[2];
+        mem00(xup, sizeof(xup));
+        int n = 0;
+        if (GetAsyncKeyState(VK_XBUTTON1)&0x8000) {
+            xup[n].type = INPUT_MOUSE;
+            xup[n].mi.dwFlags = MOUSEEVENTF_XUP;
+            xup[n].mi.mouseData = XBUTTON1;
+            n++;
+        }
+        if (GetAsyncKeyState(VK_XBUTTON2)&0x8000) {
+            xup[n].type = INPUT_MOUSE;
+            xup[n].mi.dwFlags = MOUSEEVENTF_XUP;
+            xup[n].mi.mouseData = XBUTTON2;
+            n++;
+        }
+        g_ReinjectXButtonUp = 1;
+        SendInput(n, xup, sizeof(*xup));
+        // g_ReinjectXButtonUp is cleared by the mouse hook when it observes the
+        // injected UP. If it is never seen (hook not active) leaving it set is
+        // harmless: it can only force a PASS, never a swallow.
+    }
 
     // Unhook mouse if Alt is released
     if (!state.alt) {
@@ -5299,7 +5557,18 @@ static DWORD WINAPI FinishMovementNow(LPVOID pp)
 static void FinishMovementAsync(void)
 {
     g_InFinishMovement = 1;
-    PostThreadMessage(g_WorkerThreadID, WM_DOWORK, (WPARAM)FinishMovementNow, 0);
+    if (!PostThreadMessage(g_WorkerThreadID, WM_DOWORK, (WPARAM)FinishMovementNow, 0)
+    &&  GetLastError() == ERROR_INVALID_THREAD_ID) {
+        // The worker task was not queued (this is the only thread we post to, so
+        // the failure means it is gone). Reset the flag and tear the gesture down
+        // synchronously, otherwise g_InFinishMovement would stay set and freeze
+        // mouse movement. Keep state.action for the other failures so a valid
+        // gesture keeps an entry point that can still finish it.
+        g_InFinishMovement = 0;
+        state.blockmouseup = 0;
+        state.fwmouseup = 0;
+        UnhookMouse();
+    }
 }
 
 
@@ -5415,7 +5684,33 @@ static xpure enum buttonstate GetButtonState(WPARAM wp)
 // pressed, or is always on when conf.keepMousehook is enabled.
 //
 // We should not call the next Hook for button 6-20 (manual call only).
-#define CALLNEXTHOOK (button>BT_MB5 && button <= BT_MB20? 1: CallNextHookEx(NULL, nCode, wParam, lParam))
+// Synthesized events (g_SynthXButton) are consumed here: they must never be
+// forwarded to the OS, otherwise a phantom XButton click would be injected.
+#define CALLNEXTHOOK ((g_SynthXButton || (button>BT_MB5 && button <= BT_MB20))? 1: CallNextHookEx(NULL, nCode, wParam, lParam))
+
+// Mouse hook exit probes: log swallow/pass right before each return, then
+// return the ORIGINAL value (never altering control flow/return values).
+#ifdef ALTSNAP_DIAG
+#define MOUSE_SWALLOW(reason) do { DIAG("MOUSE-SWALLOW wParam=0x%X button=%d stateDown=%d reason=%s", (unsigned)wParam, (int)button, (buttonstate==STATE_DOWN), (reason)); return 1; } while(0)
+#define MOUSE_PASS(reason)    do { DIAG("MOUSE-PASS wParam=0x%X button=%d stateDown=%d ret=0 (PASS) reason=%s", (unsigned)wParam, (int)button, (buttonstate==STATE_DOWN), (reason)); return CALLNEXTHOOK; } while(0)
+#else
+#define MOUSE_SWALLOW(reason) return 1
+#define MOUSE_PASS(reason)    return CALLNEXTHOOK
+#endif
+
+// A real side-button UP (BT_MB4/BT_MB5) must ALWAYS be forwarded to the OS.
+// The OS tracks VK_XBUTTON1/XBUTTON2 from WM_XBUTTONUP; if the UP is swallowed
+// on any path, the button stays logically held and every later click is treated
+// as a secondary click, so no other window can be activated. AltSnap still does
+// its own gesture teardown first (at the call sites); only the return differs.
+#define IS_XBUTTON_UP ((buttonstate==STATE_UP) && (button==BT_MB4 || button==BT_MB5))
+#ifdef ALTSNAP_DIAG
+#define MOUSE_SWALLOW_UNLESS_XUP(reason) do { \
+    if (IS_XBUTTON_UP) { DIAG("MOUSE-PASS wParam=0x%X button=%d stateDown=%d ret=0 (PASS) reason=%s-xup", (unsigned)wParam, (int)button, (buttonstate==STATE_DOWN), (reason)); return CallNextHookEx(NULL, nCode, wParam, lParam); } \
+    MOUSE_SWALLOW(reason); } while(0)
+#else
+#define MOUSE_SWALLOW_UNLESS_XUP(reason) do { if (IS_XBUTTON_UP) return CallNextHookEx(NULL, nCode, wParam, lParam); MOUSE_SWALLOW(reason); } while(0)
+#endif
 
 #ifdef NO_HOOK_LL
 #define CallNextHookEx(NULL, nCode, wParam, lParam) 0
@@ -5423,6 +5718,9 @@ static xpure enum buttonstate GetButtonState(WPARAM wp)
 //
 LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam)
 {
+#ifdef ALTSNAP_DIAG
+    g_diagLastMouseCb = GetTickCount(); // hook-health heartbeat (pure write)
+#endif
 //    if (state.ignoreclick) LOGA("IgnoreClick")
     // Set up some variables
     PMSLLHOOKSTRUCT msg = (PMSLLHOOKSTRUCT)lParam;
@@ -5431,8 +5729,26 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam)
 //        LOGA("wParam=%lx, data=%lx, time=%lu, extra=%lx, block?=%d, ignored?=%d", (DWORD)wParam
 //            , (DWORD)msg->mouseData, (DWORD)msg->time, (DWORD)msg->dwExtraInfo
 //            , (int)state.blockmouseup, (int)state.ignoreclick);
+#ifdef ALTSNAP_DIAG
+    // Entry probe BEFORE the early-return: every mouse event now logs a line, so a
+    // stuck state.ignoreclick can no longer hide all mouse activity. The predicate
+    // is evaluated exactly once with the SAME short-circuit order as the original;
+    // the original return value/flow is preserved verbatim.
+    {
+        int diag_ncBad  = (nCode != HC_ACTION);
+        int diag_iclick = (int)state.ignoreclick;
+        int diag_slock  = (!diag_ncBad && !diag_iclick) ? ScrollLockState() : 0;
+        if (diag_ncBad || diag_iclick || diag_slock) {
+            DIAG("MOUSE-EARLY-RETURN nCode=%d ignoreclick=%d scrolllock=%d wParam=0x%X " DIAG_CFG_FMT,
+                 nCode, diag_iclick, diag_slock, (unsigned)wParam, DIAG_CFG_ARG);
+            return CallNextHookEx(NULL, nCode, wParam, lParam);
+        }
+        DIAG("MOUSE-IN-PRE wParam=0x%X " DIAG_CFG_FMT, (unsigned)wParam, DIAG_CFG_ARG);
+    }
+#else
     if (nCode != HC_ACTION || state.ignoreclick || ScrollLockState())
         return CallNextHookEx(NULL, nCode, wParam, lParam);
+#endif
 
     // Mouse move, only if it is not exactly the same point than before
     if (wParam == WM_MOUSEMOVE) {
@@ -5479,8 +5795,21 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam)
     //Get Button state and data.
     enum buttonstate buttonstate = GetButtonState(wParam);
     enum button button = (enum button)GetButton(wParam, lParam);
+    // Remedial synthetic XBUTTON UP injected by FinishMovementNow (see below):
+    // it must reach the OS so the XButton down state is cleared. Consume the
+    // flag and forward unconditionally, bypassing CALLNEXTHOOK's synth check.
+    if (g_ReinjectXButtonUp && buttonstate==STATE_UP
+    && (button==BT_MB4 || button==BT_MB5)) {
+        g_ReinjectXButtonUp = 0;
+        return CallNextHookEx(NULL, nCode, wParam, lParam);
+    }
     // Get wheel delta
     state.delta = GET_WHEEL_DELTA_WPARAM(msg->mouseData);
+
+    DIAG("MOUSE-IN wParam=0x%X button=%d stateDown=%d ignoreclick=%d blockmouseup=%d action=%d alt=%d clickbutton=%d synth=%d " DIAG_CFG_FMT,
+         (unsigned)wParam, (int)button, (buttonstate==STATE_DOWN), (int)state.ignoreclick,
+         (int)state.blockmouseup, (int)state.action.ac, (int)state.alt,
+         (int)state.clickbutton, (int)g_SynthXButton, DIAG_CFG_ARG);
 
 //    if (button<=BT_MB5)
 //        LOGA("button=%d, %s", button, buttonstate==STATE_DOWN?"DOWN":buttonstate==STATE_UP?"UP":"NONE");
@@ -5493,7 +5822,7 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam)
     if (buttonstate == STATE_DOWN && state.action.ac && state.action.ac != conf.GrabWithAlt[ModKey()].ac) {
         // Handle click combo action!
         DoComboActions(action, button);
-        return 1; // Block mousedown so altsnap does not remove g_mainhwnd
+        MOUSE_SWALLOW("combo DoComboActions"); // Block mousedown so altsnap does not remove g_mainhwnd
     }
 
     // Handle Titlebars actions if any
@@ -5505,8 +5834,8 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam)
             // Scroll inactive window with wheel action...
             ret = ScrollPointedWindow(pt, state.delta, wParam);
         }
-        if (ret == 0) return CALLNEXTHOOK;
-        else if (ret == 1) return 1;
+        if (ret == 0) MOUSE_PASS("titlebar");
+        else if (ret == 1) MOUSE_SWALLOW("titlebar");
         ttbact = k_action_none; // No titlebar action to be done.
     }
 
@@ -5515,6 +5844,8 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam)
     int is_hotclick = IsHotclick(button);
     if (!state.alt && is_hotclick && buttonstate == STATE_DOWN) {
         state.alt = button;
+        DIAG("HOTCLICK DOWN button=%d -> state.alt=%d action=%d blockmouseup=%d blockaltup=%d",
+             (int)button, (int)state.alt, (int)action.ac, (int)state.blockmouseup, (int)state.blockaltup);
         // Start an action now if hotclick is also an action.
         // If action == AC_NONE, we are checking for blacklists...
         if (!action.ac) {
@@ -5528,39 +5859,51 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam)
         if (ret) {
             // Not balcklisted, action may have been performed!
             if (action.ac) state.alt = 0; // Done!
-            return 1;
+            MOUSE_SWALLOW("hotclick-down");
         }
 
         // Window is blacklisted.
         // So me must forward the click...
         state.alt = 0; // release alt!
         state.fwmouseup = 1; // Forward up click...
-        return CALLNEXTHOOK; // forward down click
+        MOUSE_PASS("hotclick-down-blacklisted"); // forward down click
     } else if (state.alt == button && is_hotclick && buttonstate == STATE_UP) {
         state.alt = 0;
+        DIAG("HOTCLICK UP button=%d -> state.alt=0 action=%d blockmouseup=%d blockaltup=%d sactiondone=%d",
+             (int)button, (int)action.ac, (int)state.blockmouseup, (int)state.blockaltup, (int)state.sactiondone.ac);
+        // This up event is consumed below, so release a pending mouse-up block
+        // (set by the matching down) here as well. Otherwise blockmouseup never
+        // reaches 0 and UnhookMouseOnly() refuses to uninstall the hook.
+        if (state.blockmouseup) {
+            state.blockmouseup--;
+            if (!state.blockmouseup && !state.action.ac && !state.alt)
+                UnhookMouseOnly();
+        }
         // Block hotclick up if not an action
         // Because it will not be done by state.blockmouseup
         // if (!action) return 1;
         if (!action.ac && (conf.AblockHotclick || state.sactiondone.ac))
-            return 1;
+            MOUSE_SWALLOW_UNLESS_XUP("hotclick-up-nohold");
         // If no action is to be done, we forward the click
         Send_Click_Thread(button);
-        return 1;
+        MOUSE_SWALLOW_UNLESS_XUP("hotclick-up-forwarded");
     }
 
     // Check if we must BLOCK MOUSE UP... (after releasing hotclicks)
     if (buttonstate == STATE_UP) {
+        DIAG("MOUSE-UP generic button=%d blockmouseup=%d fwmouseup=%d action=%d alt=%d",
+             (int)button, (int)state.blockmouseup, (int)state.fwmouseup, (int)state.action.ac, (int)state.alt);
         // fw/block mouse up and decrement counter.
         if (state.fwmouseup) {
             state.fwmouseup = 0;
             //LOGA("forwarded BT%d mouse up", button);
-            return CALLNEXTHOOK;
+            MOUSE_PASS("mouse-up-forwarded");
         } else if (state.blockmouseup) {
             state.blockmouseup--;
             if(!state.blockmouseup && !state.action.ac && !state.alt)
                 UnhookMouseOnly(); // We no longer need the hook.
             //LOGA("blocked BT%d mouse up", button);
-            return 1;
+            MOUSE_SWALLOW_UNLESS_XUP("mouse-up-blocked");
         }
     }
 
@@ -5573,13 +5916,13 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam)
         } else {
             // Cancel Grab timer.
             KillTimer(g_mainhwnd, GRAB_TIMER);
-            return CALLNEXTHOOK;
+            MOUSE_PASS("longclick-cancel");
         }
     }
 
     // Nothing to do...
     if (!action.ac && !ttbact.ac && buttonstate == STATE_DOWN)
-        return CALLNEXTHOOK;//CallNextHookEx(NULL, nCode, wParam, lParam);
+        MOUSE_PASS("no-action-down");//CallNextHookEx(NULL, nCode, wParam, lParam);
 
     // INIT ACTIONS on mouse down if Alt is down...
     if (buttonstate == STATE_DOWN && state.alt) {
@@ -5589,12 +5932,12 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam)
         && !IsHotclick(state.alt)
         && !IsHotkeyDown()) {
             UnhookMouse();
-            return CALLNEXTHOOK; //CallNextHookEx(NULL, nCode, wParam, lParam);
+            MOUSE_PASS("alt-down-no-hotkey"); //CallNextHookEx(NULL, nCode, wParam, lParam);
         }
         // Start an action (alt is down)
         int ret = init_movement_and_actions(pt, NULL, action, button);
-        if (!ret) return CALLNEXTHOOK;//CallNextHookEx(NULL, nCode, wParam, lParam);
-        else      return 1; // block mousedown
+        if (!ret) MOUSE_PASS("alt-down-blacklisted");//CallNextHookEx(NULL, nCode, wParam, lParam);
+        else      MOUSE_SWALLOW("alt-down-action"); // block mousedown
 
     // BUTTON UP
     } else if (buttonstate == STATE_UP) {
@@ -5624,16 +5967,34 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam)
                 // when the button is already down, so we create a thread.
                 Send_Click_Thread(button);
             }
-            return 1; // block mouseup
+            MOUSE_SWALLOW_UNLESS_XUP("up-click-action"); // block mouseup (never the XButton UP)
         }
         // If a button performing an action is released,
         // we finish all moveent and proceed.
         if (action.ac && state.action.ac) {
             FinishMovementAsync();
-            return 1;
+            MOUSE_SWALLOW_UNLESS_XUP("up-action-released");
+        }
+        // If the button that started the current movement is released but the
+        // action recomputed for the up event does not match (this happens with
+        // side buttons applied as hotclicks), still finish the movement. Relying
+        // only on the recomputed action would leave state.action stuck, making
+        // the hook swallow every following mouse event on any window.
+        if (state.action.ac && state.clickbutton == button) {
+            DIAG("MOUSE-UP gesture-end (clickbutton match) button=%d blockmouseup=%d action=%d",
+                 (int)button, (int)state.blockmouseup, (int)state.action.ac);
+            // The gesture ends here. Remove this button's own mouse-up block by
+            // decrementing instead of clearing, so a sentinel set by a combo
+            // (blockmouseup = 1) is not silently erased. This branch is mutually
+            // exclusive with the generic STATE_UP decrement above, so the count
+            // is decremented exactly once.
+            if (state.blockmouseup)
+                state.blockmouseup--;
+            FinishMovementAsync();
+            MOUSE_SWALLOW_UNLESS_XUP("up-gesture-end");
         }
     }
-    return CALLNEXTHOOK; //CallNextHookEx(NULL, nCode, wParam, lParam);
+    MOUSE_PASS("mouse-final"); //CallNextHookEx(NULL, nCode, wParam, lParam);
 } // END OF LL MOUSE PROCK
 #undef CALLNEXTHOOK
 
@@ -5657,13 +6018,21 @@ static void HookMouse(void)
     #else
     mousehook = SetWindowsHookEx(WH_MOUSE_LL, LowLevelMouseProc, hinstDLL, 0);
     #endif
+    DIAG("HookMouse -> mousehook=%lx keepMousehook=%d",
+         (unsigned long)(UINT_PTR)mousehook, (int)conf.keepMousehook);
+    #ifdef ALTSNAP_DIAG
+    SetTimer(g_mainhwnd, DIAG_TIMER, 1500, (TIMERPROC)TimerWindowProc); // periodic state dump
+    #endif
 }
 /////////////////////////////////////////////////////////////////////////////
 static void UnhookMouseOnly(void)
 {
     // Do not unhook if not hooked or if the hook is still used for something
-    if (!mousehook || conf.keepMousehook || state.blockmouseup)
+    if (!mousehook || conf.keepMousehook || state.blockmouseup) {
+        DIAG("UnhookMouseOnly SKIP mousehook=%lx keepMousehook=%d blockmouseup=%d",
+             (unsigned long)(UINT_PTR)mousehook, (int)conf.keepMousehook, (int)state.blockmouseup);
         return;
+    }
 
     // Remove mouse hook
     #ifdef NO_HOOK_LL
@@ -5675,11 +6044,17 @@ static void UnhookMouseOnly(void)
 }
 static void UnhookMouse(void)
 {
+    DIAG("UnhookMouse ENTER mousehook=%lx blockmouseup=%d blockaltup=%d action=%d",
+         (unsigned long)(UINT_PTR)mousehook, (int)state.blockmouseup, (int)state.blockaltup, (int)state.action.ac);
     // Stop action
     state.action = k_action_none;
     state.ctrl = 0;
     state.shift = 0;
     state.moving = 0;
+    // Forced reset entry point: whenever the gesture is fully torn down no
+    // mouse-up block may remain pending, otherwise UnhookMouseOnly() would
+    // never be allowed to uninstall the mouse hook.
+    state.blockmouseup = 0;
 
     SetWindowTrans(NULL);
     StopSpeedMes();
@@ -5707,6 +6082,23 @@ static VOID CALLBACK TimerWindowProc(HWND hwnd, UINT msg, UINT_PTR idEvent, DWOR
 
     //LOG("TimerWindowProc(%x, %u, %u, %lu)", (UINT)(UINT_PTR)hwnd, msg, idEvent, dwTime);
     switch (idEvent) {
+    #ifdef ALTSNAP_DIAG
+    case DIAG_TIMER: {
+        DIAG_DUMP();
+        {
+            // Log the foreground window only when it changes, to observe whether
+            // clicking another window actually switches the foreground.
+            static HWND diag_last_fg = (HWND)INVALID_HANDLE_VALUE;
+            HWND fg = GetForegroundWindow();
+            if (fg != diag_last_fg) {
+                diag_last_fg = fg;
+                DIAG("FOREGROUND hwnd=0x%lx (changed)", (unsigned long)(UINT_PTR)fg);
+            }
+        }
+        KillTimer(g_mainhwnd, DIAG_TIMER);
+        SetTimer(g_mainhwnd, DIAG_TIMER, 1500, (TIMERPROC)TimerWindowProc); // re-arm
+        } break;
+    #endif
     #ifndef NO_HOOK_LL
     case REHOOK_TIMER: {
         // Silently rehook hooks if they have been stopped (>= Win7 and LowLevelHooksTimeout)
@@ -5716,6 +6108,7 @@ static VOID CALLBACK TimerWindowProc(HWND hwnd, UINT msg, UINT_PTR idEvent, DWOR
         if (mousehook && !SamePt(state.prevpt, pt)) {
             UnhookWindowsHookEx(mousehook);
             mousehook = SetWindowsHookEx(WH_MOUSE_LL, LowLevelMouseProc, hinstDLL, 0);
+            DIAG("REHOOK_TIMER mousehook=%lx", (unsigned long)(UINT_PTR)mousehook);
         }
         } break;
     #endif
@@ -5746,10 +6139,16 @@ static VOID CALLBACK TimerWindowProc(HWND hwnd, UINT msg, UINT_PTR idEvent, DWOR
             state.hittest = 0; // No specific hittest here.
             int ret = init_movement_and_actions(pt, NULL, k_action_move, BT_PROBE);
             if (ret) { // Release mouse click if we have to move.
+#ifdef ALTSNAP_DIAG
+                DIAG("IGNORECLICK set=1 @hooks.c:%d context=GRAB_TIMER-release-click", __LINE__);
+#endif
                 InterlockedIncrement(&state.ignoreclick);
                 mouse_event(buttonswaped?MOUSEEVENTF_RIGHTUP:MOUSEEVENTF_LEFTUP
                            , 0, 0, 0, GetMessageExtraInfo());
                 InterlockedDecrement(&state.ignoreclick);
+#ifdef ALTSNAP_DIAG
+                DIAG("IGNORECLICK set=0 @hooks.c:%d context=GRAB_TIMER-release-click", __LINE__);
+#endif
                 init_movement_and_actions(pt, NULL, k_action_move, 0);
             }
         }
@@ -6794,6 +7193,7 @@ __declspec(dllexport) WNDPROC WINAPI Load(HWND mainhwnd, const TCHAR *inipath)
 
     // Set up the keyboard hook
     g_keyhook = SetWindowsHookEx(WH_KEYBOARD_LL, LowLevelKeyboardProc, hinstDLL, 0);
+    DIAG("SetWindowsHookEx WH_KEYBOARD_LL -> g_keyhook=%lx", (unsigned long)(UINT_PTR)g_keyhook);
     if (g_keyhook == NULL) {
         LOG("ERROR: Keyboard HOOK could not be set");
     }

@@ -1,0 +1,10 @@
+hooks.dll
+hooksr.o
+.gitignore
+AltSnap.exe
+altsnapr.o
+build_x64_check.log
+'
+ =
+altsnap_diag.log
+/AltSnap.ini
