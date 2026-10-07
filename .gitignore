@@ -8,3 +8,9 @@ build_x64_check.log
  =
 altsnap_diag.log
 /AltSnap.ini
+*.txt
+build_x64.log
+build_restore_x64.log
+$null
+hooks.c.diag_backup
+hooks.c.ours_backup
