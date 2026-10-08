@@ -303,6 +303,7 @@ static struct config {
     UCHAR ScrollLockState;
     UCHAR LongClickMove;
     UCHAR UniKeyHoldMenu;
+    UCHAR BlockXButtons; // Fully mask XBUTTON1/2 from applications
     // [Zones]
     UCHAR UseZones;
     UCHAR ShowZonesPrevw;
@@ -417,6 +418,7 @@ static const struct OptionListItem Input_uchars[] = {
     { "ScrollLockState", 0 },
     { "LongClickMove", 0 },
     { "UniKeyHoldMenu", 0 },
+    { "BlockXButtons", 0 },
 };
 // [Zones]
 static const struct OptionListItem Zones_uchars[] = {
@@ -5638,6 +5640,19 @@ LRESULT CALLBACK __LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam)
     // Get actions or alternate (depends on ModKey())!
     action_t action = GetAction(button); // Normal action
     action_t ttbact = GetActionT(button);// Titlebar action
+
+    // BlockXButtons: unconditional entry-level masking of the physical side
+    // buttons. DOWN is always swallowed here (applications never see a press,
+    // so no browser navigation can ever trigger, even at high click rates);
+    // UP is always forwarded so the OS clears the VK_XBUTTON async state
+    // (otherwise other windows become unclickable). This path depends on no
+    // internal state, so timing/state races cannot leak a press.
+    if (conf.BlockXButtons && (button == BT_MB4 || button == BT_MB5)) {
+        if (buttonstate == STATE_DOWN)
+            return 1;
+        if (buttonstate == STATE_UP)
+            return CallNextHookEx(NULL, nCode, wParam, lParam);
+    }
 
     // Handle another click if we are already busy with an action
     if (buttonstate == STATE_DOWN && state.action.ac && state.action.ac != conf.GrabWithAlt[ModKey()].ac) {
